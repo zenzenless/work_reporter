@@ -1,11 +1,12 @@
 import os
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
 import json
 from openai import OpenAI
+import argparse
 # 加载.env文件
 load_dotenv()
 
@@ -41,14 +42,24 @@ def find_git_repos(base_dir):
                 pass
     return git_repos
 
-def get_today_commits(repo_path, git_user):
-    """获取指定git仓库中当前用户今天的提交记录，包含所有分支"""
-    today = datetime.now().strftime('%Y-%m-%d')
+def get_commits(repo_path, git_user, period='day'):
+    """获取指定git仓库中当前用户指定时间段的提交记录，包含所有分支"""
+    if period == 'day':
+        since = datetime.now().strftime('%Y-%m-%d 00:00:00')
+        until = datetime.now().strftime('%Y-%m-%d 23:59:59')
+    elif period == 'week':
+        today = datetime.now()
+        start_of_week = today - timedelta(days=today.weekday())
+        since = start_of_week.strftime('%Y-%m-%d 00:00:00')
+        until = today.strftime('%Y-%m-%d 23:59:59')
+    else:
+        raise ValueError("Invalid period specified. Use 'day' or 'week'.")
+
     try:
         log = subprocess.check_output(
             ['git', '-C', repo_path, 'log', '--all',
-             '--since', f'{today} 00:00:00',
-             '--until', f'{today} 23:59:59',
+             '--since', since,
+             '--until', until,
              '--author', git_user,
              '--pretty=format:%s'],
             stderr=subprocess.DEVNULL
@@ -113,11 +124,65 @@ def generate_daily_report(commits):
     # else:
     #     raise Exception(f"Deepseek API error: {response.status_code} - {response.text}")
 
+
+def generate_weekly_report(commits):
+    """调用deepseek API生成周报"""
+    api_key = os.getenv('DEEPSEEK_API_KEY')
+    api_url = os.getenv('DEEPSEEK_API_URL')
+    
+    if not api_key:
+        raise ValueError("请在.env文件中设置DEEPSEEK_API_KEY")
+    if not api_url:
+        raise ValueError("请在.env文件中设置DEEPSEEK_API_URL")
+    client = OpenAI(
+        api_key=api_key,
+        base_url=api_url,
+    )
+    
+    data = {
+        'commits': commits,
+        'date': datetime.now().strftime('%Y-%m-%d')
+    }
+    
+    system_prompt = """
+用户提交一些仓库中的git提交日志，请为它们生成一份工作周报，说明本周做了什么。
+
+示例 MARKDOWN 输出:
+
+- 本周工作完成情况: 
+1. 修复了浏览器xxx的bug
+2. 优化了xxx
+3. 完成了xxx功能
+4. ...
+- 下周工作计划:
+1. 修复xxx的bug
+2. 优化xxx
+3. 完成xxx功能
+4. ...
+"""
+
+    user_prompt = json.dumps(data)
+
+    messages = [{"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}]
+
+    response = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=messages,
+        response_format={
+            'type': 'text'
+        }
+    )
+
+    return response.choices[0].message.content
 def main():
     base_dir = os.getenv('WORK_REPORT_DIR')
     if not base_dir:
         raise ValueError("请在.env文件中设置WORK_REPORT_DIR")
-    
+    parser = argparse.ArgumentParser(description='Generate work report.')
+    parser.add_argument('-w', '--weekly', action='store_true', help='Generate weekly report instead of daily report')
+    args = parser.parse_args()
+
     git_user = get_git_user()
     if not git_user:
         print("Git user not configured")
@@ -125,7 +190,9 @@ def main():
     
     all_commits = []
     for repo in find_git_repos(base_dir):
-        commits = get_today_commits(repo, git_user)
+       
+        period = 'week' if args.weekly else 'day'
+        commits = get_commits(repo, git_user, period=period)
         print(f"Found {len(commits)} commits in {repo}")
         all_commits.extend([f"repo:{repo}: commit:{commit}" for commit in commits])
     
@@ -135,7 +202,10 @@ def main():
     
     try:
         print(f"Generating daily report for commits {len(all_commits)}")
-        report = generate_daily_report(all_commits)
+        if args.weekly:
+            report = generate_weekly_report(all_commits)
+        else:
+            report = generate_daily_report(all_commits)
         print(report)
         with open('report.md', 'w') as f:
             f.write(report)
